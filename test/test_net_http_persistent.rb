@@ -11,6 +11,8 @@ end
 class TestNetHttpPersistent < MiniTest::Unit::TestCase
 
   def setup
+    # Make private methods public
+    Net::HTTP::Persistent.send(:public, *(Net::HTTP::Persistent.private_instance_methods - Object.private_instance_methods))
     @http = Net::HTTP::Persistent.new
     @uri  = URI.parse 'http://example.com/path'
 

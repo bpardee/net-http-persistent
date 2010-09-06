@@ -1,6 +1,7 @@
 require 'net/http'
 require 'net/http/faster'
 require 'uri'
+require 'gene_pool'
 
 ##
 # Persistent connections for Net::HTTP
@@ -10,10 +11,7 @@ require 'uri'
 # single persistent connection is created.
 #
 # Multiple Net::HTTP::Persistent objects will share the same set of
-# connections.
-#
-# For each thread you start a new connection will be created.  A
-# Net::HTTP::Persistent connection will not be shared across threads.
+# connections which will be checked out of a pool.
 #
 # You can shut down the HTTP connections when done by calling #shutdown.  You
 # should name your Net::HTTP::Persistent object if you intend to call this
@@ -46,20 +44,15 @@ class Net::HTTP::Persistent
   class Error < StandardError; end
 
   ##
-  # This client's OpenSSL::X509::Certificate
-
-  attr_accessor :certificate
-
-  ##
   # An SSL certificate authority.  Setting this will set verify_mode to
   # VERIFY_PEER.
 
   attr_accessor :ca_file
 
   ##
-  # Where this instance's connections live in the thread local variables
+  # This client's OpenSSL::X509::Certificate
 
-  attr_reader :connection_key # :nodoc:
+  attr_accessor :certificate
 
   ##
   # Sends debug_output to this IO via Net::HTTP#set_debug_output.
@@ -70,9 +63,14 @@ class Net::HTTP::Persistent
   attr_accessor :debug_output
 
   ##
+  # Retry even for non-idempotent (POST) requests.
+
+  attr_accessor :force_retry
+
+  ##
   # Headers that are added to every request
 
-  attr_reader :headers
+  attr_accessor :headers
 
   ##
   # Maps host:port to an HTTP version.  This allows us to enable version
@@ -92,6 +90,11 @@ class Net::HTTP::Persistent
   attr_accessor :keep_alive
 
   ##
+  # Logger for message logging.
+
+  attr_accessor :logger
+
+  ##
   # A name for this connection.  Allows you to keep your connections apart
   # from everybody else's.
 
@@ -101,6 +104,11 @@ class Net::HTTP::Persistent
   # Seconds to wait until a connection is opened.  See Net::HTTP#open_timeout
 
   attr_accessor :open_timeout
+
+  ##
+  # The maximum size of the connection pool
+
+  attr_reader :pool_size
 
   ##
   # This client's SSL private key
@@ -118,11 +126,6 @@ class Net::HTTP::Persistent
   attr_accessor :read_timeout
 
   ##
-  # Where this instance's request counts live in the thread local variables
-
-  attr_reader :request_key # :nodoc:
-
-  ##
   # SSL verification callback.  Used when ca_file is set.
 
   attr_accessor :verify_callback
@@ -134,6 +137,12 @@ class Net::HTTP::Persistent
   # You can use +verify_mode+ to override any default values.
 
   attr_accessor :verify_mode
+
+  ##
+  # The threshold in seconds for checking out a connection at which a warning 
+  # will be logged via the logger
+
+  attr_accessor :warn_timeout
 
   ##
   # Creates a new Net::HTTP::Persistent.
@@ -152,8 +161,9 @@ class Net::HTTP::Persistent
   #   proxy.user     = 'AzureDiamond'
   #   proxy.password = 'hunter2'
 
-  def initialize name = nil, proxy = nil
-    @name = name
+  def initialize(options={})
+    @name = options[:name]
+    proxy = options[:proxy]
 
     @proxy_uri = case proxy
                  when :ENV      then proxy_from_env
@@ -173,68 +183,125 @@ class Net::HTTP::Persistent
       @proxy_connection_id = [nil, *@proxy_args].join ':'
     end
 
-    @debug_output  = nil
-    @headers       = {}
-    @http_versions = {}
-    @keep_alive    = 30
-    @open_timeout  = nil
-    @read_timeout  = nil
-
-    key = ['net_http_persistent', name, 'connections'].compact.join '_'
-    @connection_key = key.intern
-    key = ['net_http_persistent', name, 'requests'].compact.join '_'
-    @request_key    = key.intern
-
-    @certificate     = nil
-    @ca_file         = nil
-    @private_key     = nil
-    @verify_callback = nil
-    @verify_mode     = nil
+    @ca_file         = options[:ca_file]
+    @certificate     = options[:certificate]
+    @debug_output    = options[:debug_output]
+    @force_retry     = options[:force_retry]
+    @headers         = options[:header]          || {}
+    @http_versions   = {}
+    @keep_alive      = options[:keep_alive]      || 30
+    @logger          = options[:logger]
+    @open_timeout    = options[:open_timeout]
+    @pool_size       = options[:pool_size]       || 1
+    @private_key     = options[:private_key]
+    @read_timeout    = options[:read_timeout]
+    @verify_callback = options[:verify_callback]
+    @verify_mode     = options[:verify_mode]
+    @warn_timeout    = options[:warn_timeout]    || 0.5
+    
+    # Hash containing connection pools based on key of host:port
+    @pool_hash = {}
+    
+    # Hash containing the request counts based on the connection
+    @count_hash = Hash.new(0)
   end
 
   ##
-  # Creates a new connection for +uri+
+  # Makes a request on +uri+.  If +req+ is nil a Net::HTTP::Get is performed
+  # against +uri+.
+  #
+  # If a block is passed #request behaves like Net::HTTP#request (the body of
+  # the response will not have been read).
+  #
+  # +req+ must be a Net::HTTPRequest subclass (see Net::HTTP for a list).
+  #
+  # If there is an error and the request is idempontent according to RFC 2616
+  # it will be retried automatically.
 
-  def connection_for uri
-    Thread.current[@connection_key] ||= {}
-    connections = Thread.current[@connection_key]
+  def request uri, req = nil, &block
+    retried      = false
+    bad_response = false
 
-    net_http_args = [uri.host, uri.port]
-    connection_id = net_http_args.join ':'
+    req = Net::HTTP::Get.new uri.request_uri unless req
 
-    if @proxy_uri then
-      connection_id << @proxy_connection_id
-      net_http_args.concat @proxy_args
+    headers.each do |pair|
+      req.add_field(*pair)
     end
 
-    connections[connection_id] ||= Net::HTTP.new(*net_http_args)
-    connection = connections[connection_id]
+    req.add_field 'Connection', 'keep-alive'
+    req.add_field 'Keep-Alive', @keep_alive
 
-    unless connection.started? then
-      connection.set_debug_output @debug_output if @debug_output
-      connection.open_timeout = @open_timeout if @open_timeout
-      connection.read_timeout = @read_timeout if @read_timeout
+    pool = pool_for uri
+    pool.with_connection do |connection|
+      begin
+        count = @count_hash[connection.object_id] += 1
+        response = connection.request req, &block
+        @http_versions["#{uri.host}:#{uri.port}"] ||= response.http_version
+        return response
 
-      ssl connection if uri.scheme == 'https'
+      rescue  Timeout::Error => e
+        due_to = "(due to #{e.message} - #{e.class})"
+        message = error_message connection
+        @logger.info "Removing connection #{due_to} #{message}" if @logger
+        remove pool, connection
+        raise
+        
+      rescue Net::HTTPBadResponse => e
+        message = error_message connection
+        if bad_response or not (idempotent? req or @force_retry)
+          @logger.info "Removing connection because of too many bad responses #{message}" if @logger
+          remove pool, connection
+          raise Error, "too many bad responses #{message}"
+        else
+          bad_response = true
+          @logger.info "Renewing connection because of too many bad responses #{message}" if @logger
+          connection = renew pool, connection
+          retry
+        end
 
-      connection.start
+      rescue IOError, EOFError, Errno::ECONNABORTED, Errno::ECONNRESET, Errno::EPIPE => e
+        due_to = "(due to #{e.message} - #{e.class})"
+        message = error_message connection
+        if retried or not (idempotent? req or @force_retry)
+          @logger.info "Removing connection #{due_to} #{message}" if @logger
+          remove pool, connection
+          raise Error, "too many connection resets #{due_to} #{message}"
+        else
+          retried = true
+          @logger.info "Renewing connection #{due_to} #{message}" if @logger
+          connection = renew pool, connection
+          retry
+        end
+      end
     end
-
-    connection
-  rescue Errno::ECONNREFUSED
-    raise Error, "connection refused: #{connection.address}:#{connection.port}"
-  rescue Errno::EHOSTDOWN
-    raise Error, "host down: #{connection.address}:#{connection.port}"
   end
+
+  ##
+  # Returns the HTTP protocol version for +uri+
+
+  def http_version uri
+    @http_versions["#{uri.host}:#{uri.port}"]
+  end
+
+  ##
+  # Shuts down all connections.
+
+  def shutdown
+    raise 'Shutdown not implemented'
+    # TBD - need to think about this one
+    @count_hash = nil
+  end
+
+  #######
+  private
+  #######
 
   ##
   # Returns an error message containing the number of requests performed on
   # this connection
 
   def error_message connection
-    requests =
-      Thread.current[@request_key][connection.object_id]
-
+    requests = @count_hash[connection] || 0
     "after #{requests} requests on #{connection.object_id}"
   end
 
@@ -249,17 +316,9 @@ class Net::HTTP::Persistent
   # Finishes the Net::HTTP +connection+
 
   def finish connection
-    Thread.current[@request_key].delete connection.object_id
-
+    @count_hash.delete(connection.object_id)
     connection.finish
   rescue IOError
-  end
-
-  ##
-  # Returns the HTTP protocol version for +uri+
-
-  def http_version uri
-    @http_versions["#{uri.host}:#{uri.port}"]
   end
 
   ##
@@ -281,6 +340,38 @@ class Net::HTTP::Persistent
   end
 
   ##
+  # Get the connection pool associated with this +uri+
+  def pool_for uri
+    net_http_args = [uri.host, uri.port]
+    connection_id = net_http_args.join ':'
+
+    if @proxy_uri then
+      connection_id << @proxy_connection_id
+      net_http_args.concat @proxy_args
+    end
+    @pool_hash[connection_id] ||= GenePool.new(:name         => connection_id,
+                                               :pool_size    => @pool_size,
+                                               :warn_timeout => @warn_timeout,
+                                               :logger       => @logger) do
+      begin
+        connection = Net::HTTP.new(*net_http_args)
+        connection.set_debug_output @debug_output if @debug_output
+        connection.open_timeout = @open_timeout if @open_timeout
+        connection.read_timeout = @read_timeout if @read_timeout
+
+        ssl connection if uri.scheme == 'https'
+
+        connection.start
+        connection
+      rescue Errno::ECONNREFUSED
+        raise Error, "connection refused: #{connection.address}:#{connection.port}"
+      rescue Errno::EHOSTDOWN
+        raise Error, "host down: #{connection.address}:#{connection.port}"
+      end
+    end
+  end
+
+  ##
   # Creates a URI for an HTTP proxy server from ENV variables.
   #
   # If +HTTP_PROXY+ is set a proxy will be returned.
@@ -297,7 +388,7 @@ class Net::HTTP::Persistent
 
     return nil if env_proxy.nil? or env_proxy.empty?
 
-    uri = URI.parse normalize_uri env_proxy
+    uri = URI.parse(normalize_uri(env_proxy))
 
     unless uri.user or uri.password then
       uri.user     = escape ENV['http_proxy_user'] || ENV['HTTP_PROXY_USER']
@@ -308,100 +399,21 @@ class Net::HTTP::Persistent
   end
 
   ##
-  # Finishes then restarts the Net::HTTP +connection+
+  # Finishes then removes the Net::HTTP +connection+
 
-  def reset connection
-    Thread.current[@request_key].delete connection.object_id
-
+  def remove pool, connection
     finish connection
-
-    connection.start
-  rescue Errno::ECONNREFUSED
-    raise Error, "connection refused: #{connection.address}:#{connection.port}"
-  rescue Errno::EHOSTDOWN
-    raise Error, "host down: #{connection.address}:#{connection.port}"
+    pool.remove(connection)
   end
 
   ##
-  # Makes a request on +uri+.  If +req+ is nil a Net::HTTP::Get is performed
-  # against +uri+.
-  #
-  # If a block is passed #request behaves like Net::HTTP#request (the body of
-  # the response will not have been read).
-  #
-  # +req+ must be a Net::HTTPRequest subclass (see Net::HTTP for a list).
-  #
-  # If there is an error and the request is idempontent according to RFC 2616
-  # it will be retried automatically.
+  # Finishes then renews the Net::HTTP +connection+.  It may be unnecessary 
+  # to completely recreate the connection but connections that get timed out
+  # in JRuby leave the ssl context in a frozen object state.
 
-  def request uri, req = nil, &block
-    Thread.current[@request_key] ||= Hash.new 0
-    retried      = false
-    bad_response = false
-
-    req = Net::HTTP::Get.new uri.request_uri unless req
-
-    headers.each do |pair|
-      req.add_field(*pair)
-    end
-
-    req.add_field 'Connection', 'keep-alive'
-    req.add_field 'Keep-Alive', @keep_alive
-
-    connection = connection_for uri
-    connection_id = connection.object_id
-
-    begin
-      count = Thread.current[@request_key][connection_id] += 1
-      response = connection.request req, &block
-
-    rescue Net::HTTPBadResponse => e
-      message = error_message connection
-
-      finish connection
-
-      raise Error, "too many bad responses #{message}" if
-        bad_response or not idempotent? req
-
-      bad_response = true
-      retry
-    rescue IOError, EOFError, Timeout::Error,
-           Errno::ECONNABORTED, Errno::ECONNRESET, Errno::EPIPE => e
-      due_to = "(due to #{e.message} - #{e.class})"
-      message = error_message connection
-
-      finish connection
-
-      raise Error, "too many connection resets #{due_to} #{message}" if
-        retried or not idempotent? req
-
-      retried = true
-      retry
-    end
-
-    @http_versions["#{uri.host}:#{uri.port}"] ||= response.http_version
-
-    response
-  end
-
-  ##
-  # Shuts down all connections in this thread.
-  #
-  # If you've used Net::HTTP::Persistent across multiple threads you must call
-  # this in each thread.
-
-  def shutdown
-    connections = Thread.current[@connection_key]
-
-    connections.each do |_, connection|
-      begin
-        connection.finish
-      rescue IOError
-      end
-    end if connections
-
-    Thread.current[@connection_key] = nil
-    Thread.current[@request_key]    = nil
+  def renew pool, connection
+    finish connection
+    connection = pool.renew(connection)
   end
 
   ##
@@ -427,6 +439,6 @@ class Net::HTTP::Persistent
 
     connection.verify_mode = @verify_mode if @verify_mode
   end
-
+  
 end
 
