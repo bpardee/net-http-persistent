@@ -162,7 +162,7 @@ class Net::HTTP::Persistent
   #   proxy.password = 'hunter2'
 
   def initialize(options={})
-    @name = options[:name]
+    @name = options[:name] || 'Net::HTTP::Persistent'
     proxy = options[:proxy]
 
     @proxy_uri = case proxy
@@ -242,19 +242,19 @@ class Net::HTTP::Persistent
       rescue  Timeout::Error => e
         due_to = "(due to #{e.message} - #{e.class})"
         message = error_message connection
-        @logger.info "Removing connection #{due_to} #{message}" if @logger
+        @logger.info "#{name}: Removing connection #{due_to} #{message}" if @logger
         remove pool, connection
         raise
         
       rescue Net::HTTPBadResponse => e
         message = error_message connection
         if bad_response or not (idempotent? req or @force_retry)
-          @logger.info "Removing connection because of too many bad responses #{message}" if @logger
+          @logger.info "#{name}: Removing connection because of too many bad responses #{message}" if @logger
           remove pool, connection
           raise Error, "too many bad responses #{message}"
         else
           bad_response = true
-          @logger.info "Renewing connection because of too many bad responses #{message}" if @logger
+          @logger.info "#{name}: Renewing connection because of too many bad responses #{message}" if @logger
           connection = renew pool, connection
           retry
         end
@@ -263,12 +263,12 @@ class Net::HTTP::Persistent
         due_to = "(due to #{e.message} - #{e.class})"
         message = error_message connection
         if retried or not (idempotent? req or @force_retry)
-          @logger.info "Removing connection #{due_to} #{message}" if @logger
+          @logger.info "#{name}: Removing connection #{due_to} #{message}" if @logger
           remove pool, connection
           raise Error, "too many connection resets #{due_to} #{message}"
         else
           retried = true
-          @logger.info "Renewing connection #{due_to} #{message}" if @logger
+          @logger.info "#{name}: Renewing connection #{due_to} #{message}" if @logger
           connection = renew pool, connection
           retry
         end
@@ -301,7 +301,7 @@ class Net::HTTP::Persistent
   # this connection
 
   def error_message connection
-    requests = @count_hash[connection] || 0
+    requests = @count_hash[connection.object_id] || 0
     "after #{requests} requests on #{connection.object_id}"
   end
 
@@ -349,7 +349,7 @@ class Net::HTTP::Persistent
       connection_id << @proxy_connection_id
       net_http_args.concat @proxy_args
     end
-    @pool_hash[connection_id] ||= GenePool.new(:name         => connection_id,
+    @pool_hash[connection_id] ||= GenePool.new(:name         => name + '-' + connection_id,
                                                :pool_size    => @pool_size,
                                                :warn_timeout => @warn_timeout,
                                                :logger       => @logger) do
