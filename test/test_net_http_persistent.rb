@@ -23,10 +23,10 @@ class Net::HTTP
     raise Errno::ECONNREFUSED if open_timeout == DUMMY_OPEN_TIMEOUT_FOR_CONNREFUSED
   end
 
-  def successful_request
+  def successful_response
     OpenStruct.new(:http_version => '1.1')
   end
-  
+
   def request(req)
     @count ||= -1
     @count += 1
@@ -34,18 +34,18 @@ class Net::HTTP
     cmd = args.shift
     i = @count % args.size if args.size > 0
     if cmd == CMD_SUCCESS || args[i] == PASS
-      return successful_request 
+      return successful_response 
     end
     case cmd
     when CMD_SLEEP
       sleep args[i].to_i
-      return  successful_request
+      return  successful_response
     when CMD_BAD_RESPONSE
       raise Net::HTTPBadResponse.new('Dummy bad response') 
     when CMD_EOF_ERROR
       raise EOFError.new('Dummy EOF error') 
     else
-      return successful_request
+      return successful_response
     end 
   end
 end
@@ -59,14 +59,12 @@ end
 
 class TestNetHttpPersistent < MiniTest::Unit::TestCase
 
-  def uri_for(path)
-    path='/'+path unless path[0] == ?/
-    URI.parse("http://example.com#{path}")
+  def uri_for(*args)
+    URI.parse("http://example.com/#{args.join('/')}")
   end
   
   def request_command(req, *args)
-    uri = uri_for(args.join('/'))
-    @http.request(uri, req)
+    @http.request(uri_for(args), req)
   end
   
   def http_and_io(options={})
@@ -80,7 +78,7 @@ class TestNetHttpPersistent < MiniTest::Unit::TestCase
 
   def setup
     @http, @io = http_and_io
-    @uri  = uri_for '/path'
+    @uri  = uri_for CMD_SUCCESS
 
     ENV.delete 'http_proxy'
     ENV.delete 'HTTP_PROXY'
@@ -500,7 +498,7 @@ class TestNetHttpPersistent < MiniTest::Unit::TestCase
     c = connection
     body = nil
   
-    res = @http.request @uri do |r|
+    res = @http.request(@uri, nil) do |r|
       body = r.read_body
     end
   
