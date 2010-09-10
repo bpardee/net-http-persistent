@@ -254,7 +254,7 @@ class Net::HTTP::Persistent
           raise Error, "too many bad responses #{message}"
         else
           bad_response = true
-          @logger.info "#{name}: Renewing connection because of too many bad responses #{message}" if @logger
+          @logger.info "#{name}: Renewing connection because of bad response #{message}" if @logger
           connection = renew pool, connection
           retry
         end
