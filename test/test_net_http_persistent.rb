@@ -10,6 +10,8 @@ CMD_SUCCESS      = 'success'
 CMD_SLEEP        = 'sleep'
 CMD_BAD_RESPONSE = 'bad_response'
 CMD_EOF_ERROR    = 'eof_error'
+CMD_CONNRESET    = 'connreset'
+CMD_ECHO         = 'echo'
 
 PASS = 'pass'
 FAIL = 'fail'
@@ -17,35 +19,48 @@ FAIL = 'fail'
 DUMMY_OPEN_TIMEOUT_FOR_HOSTDOWN    = 9000
 DUMMY_OPEN_TIMEOUT_FOR_CONNREFUSED = 9001
 
-class Net::HTTP  
+$debug = false
+
+class Net::HTTP
   def connect
     raise Errno::EHOSTDOWN    if open_timeout == DUMMY_OPEN_TIMEOUT_FOR_HOSTDOWN
     raise Errno::ECONNREFUSED if open_timeout == DUMMY_OPEN_TIMEOUT_FOR_CONNREFUSED
   end
 
   def successful_response
-    OpenStruct.new(:http_version => '1.1')
+    r = Net::HTTPResponse.allocate
+    def r.http_version() '1.1' end
+    def r.read_body() :read_body end
+    yield r if block_given?
+    r
   end
 
-  def request(req)
-    @count ||= -1
-    @count += 1
+  def request(req, &block)
+    $count += 1
+    puts "path=#{req.path} count=#{$count}" if $debug
     args = req.path[1..-1].split('/')
     cmd = args.shift
-    i = @count % args.size if args.size > 0
-    if cmd == CMD_SUCCESS || args[i] == PASS
-      return successful_response 
+    i = $count % args.size if args.size > 0
+    puts "i=#{i}" if $debug
+    if cmd == CMD_ECHO
+      res = successful_response(&block)
+      eval "def res.body() \"#{req.body}\" end"
+      return res
+    elsif cmd == CMD_SUCCESS || args[i] == PASS
+      return successful_response(&block)
     end
     case cmd
     when CMD_SLEEP
       sleep args[i].to_i
-      return  successful_response
+      return successful_response(&block)
     when CMD_BAD_RESPONSE
       raise Net::HTTPBadResponse.new('Dummy bad response') 
     when CMD_EOF_ERROR
       raise EOFError.new('Dummy EOF error') 
+    when CMD_CONNRESET
+      raise Errno::ECONNRESET
     else
-      return successful_response
+      return successful_response(&block)
     end 
   end
 end
@@ -64,6 +79,7 @@ class TestNetHttpPersistent < MiniTest::Unit::TestCase
   end
   
   def request_command(req, *args)
+    puts "uri=#{uri_for(args)}" if $debug
     @http.request(uri_for(args), req)
   end
   
@@ -71,12 +87,13 @@ class TestNetHttpPersistent < MiniTest::Unit::TestCase
     io = StringIO.new
     logger = Logger.new(io)
     logger.level = Logger::INFO
-    default_options = {:name => 'TestNetHTTPPersistent', :logger => logger}
+    default_options = {:name => 'TestNetHTTPPersistent', :logger => logger, :pool_size => 1}
     http = Net::HTTP::Persistent.new(default_options.merge(options))
     [http, io]
   end
 
   def setup
+    $count = -1
     @http, @io = http_and_io
     @uri  = uri_for CMD_SUCCESS
 
@@ -89,29 +106,6 @@ class TestNetHttpPersistent < MiniTest::Unit::TestCase
   end
 
   def teardown
-  end
-
-  def connection
-    c = Object.new
-    # Net::HTTP
-    def c.finish; @finished = true end
-    def c.request(req)
-      @req = req
-      r = Net::HTTPResponse.allocate
-      def r.http_version() '1.1' end
-      def r.read_body() :read_body end
-      yield r if block_given?
-      r
-    end
-    def c.reset; @reset = true end
-    def c.start; end
-
-    # util
-    def c.req() @req; end
-    def c.reset?; @reset end
-    def c.started?; true end
-    def c.finished?; @finished end
-    c
   end
 
   def test_initialize
@@ -427,152 +421,131 @@ class TestNetHttpPersistent < MiniTest::Unit::TestCase
       end
     end
   end
+   
+  def test_request
+    @http.headers['user-agent'] = 'test ua'
+    req = Net::HTTP::Get.new(@uri.request_uri)
+    res = @http.request(@uri, req)
   
-  # 
-  # def test_request
-  #   @http.headers['user-agent'] = 'test ua'
-  #   c = connection
-  # 
-  #   res = @http.request @uri
-  #   req = c.req
-  # 
-  #   assert_kind_of Net::HTTPResponse, res
-  # 
-  #   assert_kind_of Net::HTTP::Get, req
-  #   assert_equal '/path',      req.path
-  #   assert_equal 'keep-alive', req['connection']
-  #   assert_equal '30',         req['keep-alive']
-  #   assert_match %r%test ua%,  req['user-agent']
-  # 
-  #   assert_equal 1, reqs[c.object_id]
-  # end
-  # 
-  # def test_request_bad_response
-  #   c = connection
-  #   def c.request(*a) raise Net::HTTPBadResponse end
-  # 
-  #   e = assert_raises Net::HTTP::Persistent::Error do
-  #     @http.request @uri
-  #   end
-  # 
-  #   assert_equal 0, reqs[c.object_id]
-  #   assert_match %r%too many bad responses%, e.message
-  # end
-  # 
-  # def test_request_bad_response_retry
-  #   c = connection
-  #   def c.request(*a)
-  #     def self.request(*a)
-  #       Net::HTTPResponse.allocate
-  #     end
-  # 
-  #     raise Net::HTTPBadResponse
-  #   end
-  # 
-  #   res = @http.request @uri
-  # 
-  #   assert c.finished?
-  # end
-  # 
-  # def test_request_bad_response_unsafe
-  #   c = connection
-  #   def c.request(*a)
-  #     if instance_variable_defined? :@request then
-  #       raise 'POST must not be retried'
-  #     else
-  #       @request = true
-  #       raise Net::HTTPBadResponse
-  #     end
-  #   end
-  # 
-  #   e = assert_raises Net::HTTP::Persistent::Error do
-  #     @http.request @uri, Net::HTTP::Post.new(@uri.path)
-  #   end
-  # 
-  #   assert_equal 0, reqs[c.object_id]
-  #   assert_match %r%too many bad responses%, e.message
-  # end
-  # 
+    assert_kind_of Net::HTTPResponse, res
+  
+    assert_kind_of Net::HTTP::Get, req
+    assert_equal @uri.path,    req.path
+    assert_equal 'keep-alive', req['connection']
+    assert_equal '30',         req['keep-alive']
+    assert_match %r%test ua%,  req['user-agent']
+  end
+  
   def test_request_block
     @http.headers['user-agent'] = 'test ua'
-    c = connection
     body = nil
-  
-    res = @http.request(@uri, nil) do |r|
+    
+    req = Net::HTTP::Get.new(@uri.request_uri)
+    res = @http.request(@uri, req) do |r|
       body = r.read_body
     end
-  
-    req = c.req
   
     assert_kind_of Net::HTTPResponse, res
     refute_nil body
   
     assert_kind_of Net::HTTP::Get, req
-    assert_equal '/path',      req.path
+    assert_equal @uri.path,    req.path
     assert_equal 'keep-alive', req['connection']
     assert_equal '30',         req['keep-alive']
     assert_match %r%test ua%,  req['user-agent']
-  
-    assert_equal 1, reqs[c.object_id]
   end
-  # 
-  # def test_request_reset
-  #   c = connection
-  #   def c.request(*a) raise Errno::ECONNRESET end
-  # 
-  #   e = assert_raises Net::HTTP::Persistent::Error do
-  #     @http.request @uri
-  #   end
-  # 
-  #   assert_equal 0, reqs[c.object_id]
-  #   assert_match %r%too many connection resets%, e.message
-  # end
-  # 
-  # def test_request_reset_retry
-  #   c = connection
-  #   def c.request(*a)
-  #     def self.request(*a)
-  #       Net::HTTPResponse.allocate
-  #     end
-  # 
-  #     raise Errno::ECONNRESET
-  #   end
-  # 
-  #   res = @http.request @uri
-  # 
-  #   assert c.finished?
-  # end
-  # 
-  # def test_request_reset_unsafe
-  #   c = connection
-  #   def c.request(*a)
-  #     if instance_variable_defined? :@request then
-  #       raise 'POST must not be retried'
-  #     else
-  #       @request = true
-  #       raise Errno::ECONNRESET
-  #     end
-  #   end
-  # 
-  #   e = assert_raises Net::HTTP::Persistent::Error do
-  #     @http.request @uri, Net::HTTP::Post.new(@uri.path)
-  #   end
-  # 
-  #   assert_equal 0, reqs[c.object_id]
-  #   assert_match %r%too many connection resets%, e.message
-  # end
-  # 
-  # def test_request_post
-  #   c = connection
-  # 
-  #   post = Net::HTTP::Post.new @uri.path
-  # 
-  #   res = @http.request @uri, post
-  #   req = c.req
-  # 
-  #   assert_same post, req
-  # end
-  # 
+
+  def test_request_bad_response
+    e = assert_raises Net::HTTP::Persistent::Error do
+      request_command nil, CMD_BAD_RESPONSE, FAIL, FAIL
+    end
+    assert_match %r%too many bad responses%, e.message
+    assert_match %r%Renewing connection because of bad response%, @io.string
+    assert_match %r%Removing connection because of too many bad responses%, @io.string
+
+    res = request_command nil, CMD_SUCCESS
+    assert_kind_of Net::HTTPResponse, res
+  end
+
+  def test_request_connreset
+    e = assert_raises Net::HTTP::Persistent::Error do
+      request_command nil, CMD_CONNRESET, FAIL, FAIL
+    end
+  
+    assert_match %r%too many connection resets%, e.message
+    assert_match %r%Renewing connection %, @io.string
+    assert_match %r%Removing connection %, @io.string
+
+    res = request_command nil, CMD_SUCCESS
+    assert_kind_of Net::HTTPResponse, res
+  end
+  
+  def test_request_bad_response_retry
+    res = request_command nil, CMD_BAD_RESPONSE, FAIL, PASS
+    assert_match %r%Renewing connection because of bad response%, @io.string
+    assert_kind_of Net::HTTPResponse, res
+  end
+ 
+  def test_request_connreset_retry
+    res = request_command nil, CMD_CONNRESET, FAIL, PASS
+    assert_match %r%Renewing connection %, @io.string
+    assert_kind_of Net::HTTPResponse, res
+  end
+
+  def test_request_bad_response_post
+    uri = uri_for CMD_BAD_RESPONSE, FAIL, PASS
+    post = Net::HTTP::Post.new(uri.request_uri)
+    e = assert_raises Net::HTTP::Persistent::Error do
+      request_command post, CMD_BAD_RESPONSE, FAIL, PASS
+    end
+    assert_match %r%too many bad responses%, e.message
+    assert_match %r%Removing connection because of too many bad responses%, @io.string
+
+    res = request_command nil, CMD_SUCCESS
+    assert_kind_of Net::HTTPResponse, res
+  end
+
+  
+  def test_request_connreset_post
+    uri = uri_for CMD_CONNRESET, FAIL, PASS
+    post = Net::HTTP::Post.new(uri.request_uri)
+    e = assert_raises Net::HTTP::Persistent::Error do
+      request_command post, CMD_CONNRESET, FAIL, PASS
+    end
+    assert_match %r%too many connection resets%, e.message
+    assert_match %r%Removing connection %, @io.string
+
+    res = request_command nil, CMD_SUCCESS
+    assert_kind_of Net::HTTPResponse, res
+  end
+  
+  def test_request_bad_response_post_force_retry
+    @http.force_retry = true
+    uri = uri_for CMD_BAD_RESPONSE, FAIL, PASS
+    post = Net::HTTP::Post.new(uri.request_uri)
+    res = request_command post, CMD_BAD_RESPONSE, FAIL, PASS
+    assert_match %r%Renewing connection because of bad response%, @io.string
+    assert_kind_of Net::HTTPResponse, res
+  end
+    
+  def test_request_connreset_post_force_retry
+    @http.force_retry = true
+    uri = uri_for CMD_CONNRESET, FAIL, PASS
+    post = Net::HTTP::Post.new(uri.request_uri)
+    res = request_command post, CMD_CONNRESET, FAIL, PASS
+    assert_match %r%Renewing connection %, @io.string
+    assert_kind_of Net::HTTPResponse, res
+  end
+  
+  def test_request_post
+    uri = uri_for CMD_ECHO
+    post = Net::HTTP::Post.new(uri.request_uri)
+    post.body = 'hello Net::HTTP::Persistent'
+    res = request_command post, CMD_ECHO
+    assert_kind_of Net::HTTPResponse, res
+    assert_equal post.body, res.body
+  end
+  
   # def test_shutdown
   #   c = connection
   #   cs = conns
@@ -654,6 +627,5 @@ class TestNetHttpPersistent < MiniTest::Unit::TestCase
     assert c.use_ssl?
     assert_equal OpenSSL::SSL::VERIFY_NONE, c.verify_mode
   end
-
 end
 
