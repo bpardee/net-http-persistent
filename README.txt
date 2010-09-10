@@ -72,13 +72,13 @@ class with the connection/thread implementation.
     )
 
     def send_get_message
-	  uri = URI.parse('https://www.example.com/echo/foo')
+      uri = URI.parse('https://www.example.com/echo/foo')
       response = @@http.request(uri)
       ... Handle response as you would a normal Net::HTTPResponse ...
     end
 
     def send_post_message
-	  uri = URI.parse('https://www.example.com/echo/foo')
+      uri = URI.parse('https://www.example.com/echo/foo')
       request = Net::HTTP::Post.new(uri.request_uri)
       ... Modify request as needed ...
       response = @@http.request(uri, request)
