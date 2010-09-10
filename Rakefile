@@ -7,7 +7,6 @@ Hoe.plugin :git
 Hoe.plugin :minitest
 
 Hoe.spec 'bpardee-net-http-persistent' do |p|
-  self.rubyforge_name = 'seattlerb'
   developer 'Eric Hodel', 'drbrain@segment7.net'
   extra_deps << ['gene_pool', '>= 1.0']
 end
