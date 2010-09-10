@@ -9,8 +9,6 @@ thread-safe too!
 
 == FORK DESCRIPTION
 
-This is an ALPHA version that is mostly untested.
-
 This is an experimental branch that implements a connection pool of 
 Net::HTTP objects instead of a connection/thread.  C/T is fine if
 you're only using your http threads to make connections but if you 
@@ -60,7 +58,33 @@ class with the connection/thread implementation.
 
 == INSTALL:
 
-  gem install net-http-persistent
+  gem install bpardee-net-http-persistent
+
+== EXAMPLE USAGE:
+
+  class MyHttpClient
+    @@http ||= Net::HTTP::Persistent.new(
+      :name         => 'MyHttpClient',
+      :logger       => Rails.logger,
+      :pool_size    => 10,
+      :warn_timeout => 0.25,
+      :force_retry  => true
+    )
+
+    def send_get_message
+	  uri = URI.parse('https://www.example.com/echo/foo')
+      response = @@http.request(uri)
+      ... Handle response as you would a normal Net::HTTPResponse ...
+    end
+
+    def send_post_message
+	  uri = URI.parse('https://www.example.com/echo/foo')
+      request = Net::HTTP::Post.new(uri.request_uri)
+      ... Modify request as needed ...
+      response = @@http.request(uri, request)
+      ... Handle response as you would a normal Net::HTTPResponse ...
+    end
+  end
 
 == LICENSE:
 
