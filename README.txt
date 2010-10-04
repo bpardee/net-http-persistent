@@ -4,6 +4,8 @@
 
 == DESCRIPTION:
 
+This fork has been superseded by the project persistent_http.
+
 Persistent connections using Net::HTTP plus a speed fix for 1.8.  It's
 thread-safe too!
 
